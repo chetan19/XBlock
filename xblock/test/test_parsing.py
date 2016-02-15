@@ -7,6 +7,7 @@ import textwrap
 import unittest
 import ddt
 import mock
+from lxml import etree
 
 from xblock.core import XBlock, XML_NAMESPACES
 from xblock.fields import Scope, String, Integer, Dict, List
@@ -59,6 +60,33 @@ class Specialized(XBlock):
         block = runtime.construct_xblock_from_class(cls, keys)
         block.num_children = len(node)
         return block
+
+
+class CustomXml(XBlock):
+    """A block that does its own XML parsing and preserves comments"""
+    inner_xml = String(default='', scope=Scope.content)
+    has_children = True
+
+    @classmethod
+    def parse_xml(cls, node, runtime, keys, id_generator):
+        """Parse the XML node and save it as a string"""
+        block = runtime.construct_xblock_from_class(cls, keys)
+        for child in node:
+            if child.tag is not etree.Comment:
+                block.runtime.add_node_as_child(block, child, id_generator)
+        # Now build self.inner_xml from the XML of node's children
+        # We can't just call tostring() on each child because it adds xmlns: attributes
+        xml_str = etree.tostring(node)
+        block.inner_xml = xml_str[xml_str.index('>') + 1:xml_str.rindex('<')]
+        return block
+
+    def add_xml_to_node(self, node):
+        """ For exporting, set data on `node` from ourselves. """
+        node.tag = self.xml_element_name()
+        parsed_inner_xml = etree.XML('<x>{}</x>'.format(self.inner_xml))
+        node.text = parsed_inner_xml.text
+        for child in parsed_inner_xml:
+            node.append(child)
 
 # Helpers
 
@@ -130,6 +158,41 @@ class ParsingTest(XmlTest, unittest.TestCase):
         self.assertIsInstance(child2, Leaf)
         self.assertEqual(child2.data1, "child2")
         self.assertEqual(child2.parent, block.scope_ids.usage_id)
+
+    @XBlock.register_temp_plugin(Leaf)
+    @XBlock.register_temp_plugin(Container)
+    def test_xml_with_comments(self):
+        block = self.parse_xml_to_block("""\
+                    <!-- This is a comment -->
+                    <container>
+                        <leaf data1='child1'/>
+                        <!-- <leaf data1='ignore'/> -->
+                        <leaf data1='child2'/>
+                    </container>
+                    """)
+        self.assertIsInstance(block, Container)
+        self.assertEqual(len(block.children), 2)
+
+    @XBlock.register_temp_plugin(Leaf)
+    @XBlock.register_temp_plugin(CustomXml)
+    def test_comments_in_field_preserved(self):
+        """
+        Check that comments made by users inside field data are preserved.
+        """
+        block = self.parse_xml_to_block("""\
+                    <!-- This is a comment outside a block - it can be lost -->
+                    <customxml>A<!--B--><leaf/>C<leaf/><!--D-->E</customxml>
+                    """)
+        self.assertIsInstance(block, CustomXml)
+        self.assertEqual(len(block.children), 2)
+
+        xml = self.export_xml_for_block(block)
+        self.assertIn('A<!--B--><leaf/>C<leaf/><!--D-->E', xml)
+        block_imported = self.parse_xml_to_block(xml)
+        self.assertEqual(
+            block_imported.inner_xml,
+            "A<!--B--><leaf/>C<leaf/><!--D-->E"
+        )
 
     @XBlock.register_temp_plugin(Leaf)
     @XBlock.register_temp_plugin(Specialized)
@@ -281,6 +344,111 @@ class ExportTest(XmlTest, unittest.TestCase):
         with mock.patch('logging.warn') as patched_warn:
             block = self.parse_xml_to_block(xml)
             patched_warn.assert_called_once_with("XBlock %s does not contain field %s", type(block), parameter_name)
+
+
+class TestRoundTrip(XmlTest, unittest.TestCase):
+    """ Test serialization-deserialization sequence """
+
+    def create_block(self, block_type):
+        """
+        Create a block
+        """
+        def_id = self.runtime.id_generator.create_definition(block_type)
+        usage_id = self.runtime.id_generator.create_usage(def_id)
+        block = self.runtime.get_block(usage_id)
+        return block
+
+    @XBlock.register_temp_plugin(LeafWithDictAndList)
+    def test_string_roundtrip(self):
+        """ Test correctly serializes-deserializes List and Dicts with plain string contents """
+        block = self.create_block("leafwithdictandlist")
+
+        expected_seq = ['1', '2']
+        expected_dict = {'1': '1', 'ping': 'ack'}
+        block.sequence = expected_seq
+        block.dictionary = expected_dict
+        xml = self.export_xml_for_block(block)
+
+        parsed = self.parse_xml_to_block(xml)
+
+        self.assertEqual(parsed.sequence, expected_seq)
+        self.assertEqual(parsed.dictionary, expected_dict)
+
+    @XBlock.register_temp_plugin(LeafWithDictAndList)
+    def test_unicode_roundtrip(self):
+        """ Test correctly serializes-deserializes List and Dicts with unicode contents """
+        block = self.create_block("leafwithdictandlist")
+
+        expected_seq = [u'1', u'2']
+        expected_dict = {u'1': u'1', u'ping': u'ack'}
+        block.sequence = expected_seq
+        block.dictionary = expected_dict
+        xml = self.export_xml_for_block(block)
+
+        parsed = self.parse_xml_to_block(xml)
+
+        self.assertEqual(parsed.sequence, expected_seq)
+        self.assertEqual(parsed.dictionary, expected_dict)
+
+    @XBlock.register_temp_plugin(LeafWithDictAndList)
+    def test_integers_roundtrip(self):
+        """ Test correctly serializes-deserializes List and Dicts with integer contents """
+        block = self.create_block("leafwithdictandlist")
+
+        expected_seq = [1, 2, 3]
+        expected_dict = {1: 10, 2: 20}
+        block.sequence = expected_seq
+        block.dictionary = expected_dict
+        xml = self.export_xml_for_block(block)
+        parsed = self.parse_xml_to_block(xml)
+
+        self.assertEqual(parsed.sequence, expected_seq)
+        self.assertNotEqual(parsed.dictionary, expected_dict)
+        self.assertEqual(parsed.dictionary, {str(key): value for key, value in expected_dict.items()})
+
+    @XBlock.register_temp_plugin(LeafWithDictAndList)
+    def test_none_contents_roundtrip(self):
+        """ Test correctly serializes-deserializes List and Dicts with keys/values of None """
+        block = self.create_block("leafwithdictandlist")
+
+        expected_seq = [1, None, 3, None]
+        expected_dict = {"1": None, None: 20}
+        block.sequence = expected_seq
+        block.dictionary = expected_dict
+        xml = self.export_xml_for_block(block)
+        parsed = self.parse_xml_to_block(xml)
+
+        self.assertEqual(parsed.sequence, expected_seq)
+        self.assertNotEqual(parsed.dictionary, expected_dict)
+        self.assertEqual(parsed.dictionary, {"1": None, 'null': 20})
+
+    @XBlock.register_temp_plugin(LeafWithDictAndList)
+    def test_none_roundtrip(self):
+        """ Test correctly serializes-deserializes Null List and Dict fields """
+        block = self.create_block("leafwithdictandlist")
+
+        block.sequence = None
+        block.dictionary = None
+        xml = self.export_xml_for_block(block)
+        parsed = self.parse_xml_to_block(xml)
+
+        self.assertIsNone(parsed.sequence)
+        self.assertIsNone(parsed.dictionary)
+
+    @XBlock.register_temp_plugin(LeafWithDictAndList)
+    def test_nested_roundtrip(self):
+        """ Test correctly serializes-deserializes nested List and Dict fields """
+        block = self.create_block("leafwithdictandlist")
+
+        expected_seq = [[1, 2], ["3", "4"], {"1": "2"}]
+        expected_dict = {"outer1": {"inner1": "1", "inner2": 2}, "outer2": [1, 2, 3]}
+        block.sequence = expected_seq
+        block.dictionary = expected_dict
+        xml = self.export_xml_for_block(block)
+        parsed = self.parse_xml_to_block(xml)
+
+        self.assertEqual(parsed.sequence, expected_seq)
+        self.assertEqual(parsed.dictionary, expected_dict)
 
 
 def squish(text):

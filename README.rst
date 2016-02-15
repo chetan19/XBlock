@@ -163,8 +163,8 @@ the XBlock SDK: https://github.com/edx/xblock-sdk
 License
 -------
 
-The code in this repository is licensed under version 3 of the AGPL unless
-otherwise noted.
+The code in this repository is licensed the Apache 2.0 license unless otherwise
+noted.
 
 Please see ``LICENSE.txt`` for details.
 
@@ -189,16 +189,18 @@ Please do not report security issues in public. Please email security@edx.org
 Packaging
 ---------
 
-To package a new release, first tag the commit to be released
+To package a new release:
+
+#. Update the version number in setup.py and xblock/__init__.py.
+
+#. Tag the commit to be released::
 
     $VERSION=0.5
     git tag -a -m "XBlock version $VERSION" xblock-$VERSION
 
-then upload to PyPI
+#. Upload to PyPI::
 
     make package
-
-All of the heavy lifting is handled by python-versioneer (https://github.com/warner/python-versioneer)
 
 
 Mailing List and IRC Channel
@@ -211,5 +213,5 @@ __ https://groups.google.com/group/edx-code
 
 .. |build-status| image:: https://travis-ci.org/edx/XBlock.svg?branch=master
    :target: https://travis-ci.org/edx/XBlock
-.. |coverage-status| image:: https://coveralls.io/repos/edx/XBlock/badge.png
+.. |coverage-status| image:: https://coveralls.io/repos/edx/XBlock/badge.svg
    :target: https://coveralls.io/r/edx/XBlock

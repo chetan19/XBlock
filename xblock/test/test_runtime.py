@@ -302,7 +302,7 @@ def test_runtime_render():
     update_string = u"ultimate update"
     tester = TestXBlockNoFallback(Mock(), scope_ids=Mock(spec=ScopeIds))
     with assert_raises(NoSuchViewError):
-        runtime.render(tester, 'test_nonexistant_view', [update_string])
+        runtime.render(tester, 'test_nonexistent_view', [update_string])
 
 
 class SerialDefaultKVS(DictKeyValueStore):
@@ -524,10 +524,8 @@ class TestMixologist(object):
         assert_equals(4, len(post_mixed.__bases__))
 
 
-@XBlock.needs("i18n")
-@XBlock.wants("secret_service")
-@XBlock.needs("no_such_service")
-@XBlock.wants("another_not_service")
+@XBlock.needs("i18n", "no_such_service")
+@XBlock.wants("secret_service", "another_not_service")
 class XBlockWithServices(XBlock):
     """
     Test XBlock class with service declarations.
@@ -646,7 +644,8 @@ class TestRuntimeGetBlock(TestCase):
         self.id_reader.get_block_type.assert_called_with(self.def_id)
         self.construct_block.assert_called_with(
             self.block_type,
-            ScopeIds(self.user_id, self.block_type, self.def_id, self.usage_id)
+            ScopeIds(self.user_id, self.block_type, self.def_id, self.usage_id),
+            for_parent=None,
         )
 
     def test_missing_usage(self):

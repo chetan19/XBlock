@@ -23,7 +23,7 @@ from xblock.exceptions import (
     DisallowedFileError,
     FieldDataDeprecationWarning,
 )
-from xblock.fields import Dict, Float, Integer, List, Field, Scope, ScopeIds
+from xblock.fields import Dict, Float, Integer, List, Set, Field, Scope, ScopeIds
 from xblock.field_data import FieldData, DictFieldData
 from xblock.mixins import ScopedStorageMixin
 from xblock.runtime import Runtime
@@ -143,6 +143,59 @@ def test_list_field_access():
     assert_equals([11, 12, 13, 14], field_data.get(field_tester, 'field_b'))
     assert_equals([4, 5, 6, 7], field_data.get(field_tester, 'field_c'))
     assert_equals([1], field_data.get(field_tester, 'field_d'))
+
+
+def test_set_field_access():
+    # Check that sets are correctly saved when not directly set
+    class FieldTester(XBlock):
+        """Test XBlock for field access testing"""
+        field_a = Set(scope=Scope.settings)
+        field_b = Set(scope=Scope.content, default=[1, 2, 3])
+        field_c = Set(scope=Scope.content, default=[4, 5, 6])
+        field_d = Set(scope=Scope.settings)
+
+    field_tester = FieldTester(MagicMock(), DictFieldData({'field_a': [200], 'field_b': [11, 12, 13]}), Mock())
+
+    # Check initial values have been set properly
+    assert_equals(set([200]), field_tester.field_a)
+    assert_equals(set([11, 12, 13]), field_tester.field_b)
+    assert_equals(set([4, 5, 6]), field_tester.field_c)
+    assert_equals(set(), field_tester.field_d)
+
+    # Update the fields
+    field_tester.field_a.add(1)
+    field_tester.field_b.add(14)
+    field_tester.field_c.remove(5)
+    field_tester.field_d.add(1)
+
+    # The fields should be update in the cache, but /not/ in the underlying kvstore.
+    assert_equals(set([200, 1]), field_tester.field_a)
+    assert_equals(set([11, 12, 13, 14]), field_tester.field_b)
+    assert_equals(set([4, 6]), field_tester.field_c)
+    assert_equals(set([1]), field_tester.field_d)
+
+    # Examine model data directly
+    #  Caveat: there's not a clean way to copy the originally provided values for `field_a` and `field_b`
+    #  when we instantiate the XBlock. So, the values for those two in both `_field_data` and `_field_data_cache`
+    #  point at the same object. Thus, `field_a` and `field_b` actually have the correct values in
+    #  `_field_data` right now. `field_c` does not, because it has never been written to the `_field_data`.
+    assert_false(field_tester._field_data.has(field_tester, 'field_c'))
+    assert_false(field_tester._field_data.has(field_tester, 'field_d'))
+
+    # save the XBlock
+    field_tester.save()
+
+    # verify that the fields have been updated correctly
+    assert_equals(set([200, 1]), field_tester.field_a)
+    assert_equals(set([11, 12, 13, 14]), field_tester.field_b)
+    assert_equals(set([4, 6]), field_tester.field_c)
+    assert_equals(set([1]), field_tester.field_d)
+    # Now, the fields should be updated in the underlying kvstore
+
+    assert_equals(set([200, 1]), field_tester._field_data.get(field_tester, 'field_a'))
+    assert_equals(set([11, 12, 13, 14]), field_tester._field_data.get(field_tester, 'field_b'))
+    assert_equals(set([4, 6]), field_tester._field_data.get(field_tester, 'field_c'))
+    assert_equals(set([1]), field_tester._field_data.get(field_tester, 'field_d'))
 
 
 def test_mutable_none_values():
@@ -640,7 +693,8 @@ def test_get_mutable_mark_dirty():
 
     # Now test after having explicitly set the field.
     mutable_test.save()
-    assert_equals(len(mutable_test._dirty_fields), 0)
+    # _dirty_fields shouldn't be cleared here
+    assert_equals(len(mutable_test._dirty_fields), 1)
     _test_get = mutable_test.list_field
     assert_equals(len(mutable_test._dirty_fields), 1)
 
@@ -912,3 +966,43 @@ class TestXBlockDeprecation(WarningTestMixin, unittest.TestCase):
         with self.assertWarns(FieldDataDeprecationWarning):
             block._field_data = field_data
         self.assertEqual(field_data, block._field_data)
+
+
+class TestIndexResults(unittest.TestCase):
+    """
+    Tests to confirm that default block has empty index, and that XBlocks can provide custom index dictionary
+    """
+
+    class TestXBlock(XBlock):
+        """
+        Class to test default Xblock provides a dictionary
+        """
+        pass
+
+    class TestIndexedXBlock(XBlock):
+        """
+        Class to test when an Xblock provides a dictionary
+        """
+
+        def index_dictionary(self):
+            return {
+                "test_field": "ABC123",
+                "text_block": "Here is some text that was indexed",
+            }
+
+    def test_default_index_view(self):
+        test_runtime = TestRuntime(services={'field-data': DictFieldData({})})
+        test_xblock = self.TestXBlock(test_runtime, scope_ids=Mock(spec=ScopeIds))
+
+        index_info = test_xblock.index_dictionary()
+        self.assertFalse(index_info)
+        self.assertTrue(isinstance(index_info, dict))
+
+    def test_override_index_view(self):
+        test_runtime = TestRuntime(services={'field-data': DictFieldData({})})
+        test_xblock = self.TestIndexedXBlock(test_runtime, scope_ids=Mock(spec=ScopeIds))
+
+        index_info = test_xblock.index_dictionary()
+        self.assertTrue(index_info)
+        self.assertTrue(isinstance(index_info, dict))
+        self.assertEqual(index_info["test_field"], "ABC123")

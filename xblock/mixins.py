@@ -7,6 +7,8 @@ import functools
 import inspect
 import logging
 from lxml import etree
+import copy
+from collections import OrderedDict
 
 try:
     import simplesjson as json  # pylint: disable=F0401
@@ -21,10 +23,12 @@ from xblock.fields import Field, Reference, Scope, ReferenceList
 from xblock.internal import class_lazy, NamedAttributesMetaclass
 
 
-XML_NAMESPACES = {
-    "option": "http://code.edx.org/xblock/option",
-    "block": "http://code.edx.org/xblock/block",
-}
+# OrderedDict is used so that namespace attributes are put in predictable order
+# This allows for simple string equality assertions in tests and have no other effects
+XML_NAMESPACES = OrderedDict([
+    ("option", "http://code.edx.org/xblock/option"),
+    ("block", "http://code.edx.org/xblock/block"),
+])
 
 
 class HandlersMixin(object):
@@ -34,14 +38,21 @@ class HandlersMixin(object):
 
     @classmethod
     def json_handler(cls, func):
-        """Wrap a handler to consume and produce JSON.
+        """
+        Wrap a handler to consume and produce JSON.
 
         Rather than a Request object, the method will now be passed the
-        JSON-decoded body of the request.  Any data returned by the function
+        JSON-decoded body of the request. The request should be a POST request
+        in order to use this method. Any data returned by the function
         will be JSON-encoded and returned as the response.
 
         The wrapped function can raise JsonHandlerError to return an error
         response with a non-200 status code.
+
+        This decorator will return a 405 HTTP status code if the method is not
+        POST.
+        This decorator will return a 400 status code if the body contains
+        invalid JSON.
         """
         @cls.handler
         @functools.wraps(func)
@@ -65,7 +76,11 @@ class HandlersMixin(object):
 
     @classmethod
     def handler(cls, func):
-        """A decorator to indicate a function is usable as a handler."""
+        """
+        A decorator to indicate a function is usable as a handler.
+
+        The wrapped function must return a `webob.Response` object.
+        """
         func._is_xblock_handler = True      # pylint: disable=protected-access
         return func
 
@@ -109,18 +124,20 @@ class RuntimeServicesMixin(object):
         super(RuntimeServicesMixin, self).__init__(**kwargs)
 
     @classmethod
-    def needs(cls, service_name):
-        """A class decorator to indicate that an XBlock class needs a particular service."""
+    def needs(cls, *service_names):
+        """A class decorator to indicate that an XBlock class needs particular services."""
         def _decorator(cls_):                                # pylint: disable=missing-docstring
-            cls_._services_requested[service_name] = "need"  # pylint: disable=protected-access
+            for service_name in service_names:
+                cls_._services_requested[service_name] = "need"  # pylint: disable=protected-access
             return cls_
         return _decorator
 
     @classmethod
-    def wants(cls, service_name):
-        """A class decorator to indicate that an XBlock class wants a particular service."""
+    def wants(cls, *service_names):
+        """A class decorator to indicate that an XBlock class wants particular services."""
         def _decorator(cls_):                                # pylint: disable=missing-docstring
-            cls_._services_requested[service_name] = "want"  # pylint: disable=protected-access
+            for service_name in service_names:
+                cls_._services_requested[service_name] = "want"  # pylint: disable=protected-access
             return cls_
         return _decorator
 
@@ -129,8 +146,8 @@ class RuntimeServicesMixin(object):
         """
         Find and return a service declaration.
 
-        XBlocks declare their service requirements with @XBlock.needs and
-        @XBlock.wants decorators.  These store information on the class.
+        XBlocks declare their service requirements with `@XBlock.needs` and
+        `@XBlock.wants` decorators.  These store information on the class.
         This function finds those declarations for a block.
 
         Arguments:
@@ -233,39 +250,61 @@ class ScopedStorageMixin(RuntimeServicesMixin):
         if not self._dirty_fields:
             # nop if _dirty_fields attribute is empty
             return
-        try:
-            fields_to_save = self._get_fields_to_save()
-            # Throws KeyValueMultiSaveError if things go wrong
-            self._field_data.set_many(self, fields_to_save)
 
+        fields_to_save = self._get_fields_to_save()
+        if fields_to_save:
+            self.force_save_fields(fields_to_save)
+
+    def force_save_fields(self, field_names):
+        """
+        Save all fields that are specified in `field_names`, even
+        if they are not dirty.
+        """
+        fields = [self.fields[field_name] for field_name in field_names]
+        fields_to_save_json = {}
+        for field in fields:
+            fields_to_save_json[field.name] = field.to_json(self._field_data_cache[field.name])
+
+        try:
+            # Throws KeyValueMultiSaveError if things go wrong
+            self._field_data.set_many(self, fields_to_save_json)
         except KeyValueMultiSaveError as save_error:
-            saved_fields = [field for field in self._dirty_fields if field.name in save_error.saved_field_names]
+            saved_fields = [field for field in fields if field.name in save_error.saved_field_names]
             for field in saved_fields:
                 # should only find one corresponding field
-                del self._dirty_fields[field]
-            raise XBlockSaveError(saved_fields, self._dirty_fields.keys())
+                fields.remove(field)
+                # if the field was dirty, delete from dirty fields
+                self._reset_dirty_field(field)
+            msg = 'Error saving fields {}'.format(save_error.saved_field_names)
+            raise XBlockSaveError(saved_fields, fields, msg)
 
         # Remove all dirty fields, since the save was successful
-        self._clear_dirty_fields()
+        for field in fields:
+            self._reset_dirty_field(field)
 
     def _get_fields_to_save(self):
         """
-        Create dictionary mapping between dirty fields and data cache values.
-        A `field` is an instance of `Field`.
+        Get an xblock's dirty fields.
         """
-        fields_to_save = {}
-        for field in self._dirty_fields.keys():
-            # If the field value isn't the same as the baseline we recorded
-            # when it was read, then save it
-            if field._is_dirty(self):  # pylint: disable=protected-access
-                fields_to_save[field.name] = field.to_json(self._field_data_cache[field.name])
-        return fields_to_save
+        # If the field value isn't the same as the baseline we recorded
+        # when it was read, then save it
+        # pylint: disable=protected-access
+        return [field.name for field in self._dirty_fields if field._is_dirty(self)]
 
     def _clear_dirty_fields(self):
         """
         Remove all dirty fields from an XBlock.
         """
         self._dirty_fields.clear()
+
+    def _reset_dirty_field(self, field):
+        """
+        Resets dirty field value with the value from the field data cache.
+        """
+        if field in self._dirty_fields:
+            self._dirty_fields[field] = copy.deepcopy(
+                self._field_data_cache[field.name]
+            )
 
     def __repr__(self):
         # `ScopedStorageMixin` obtains the `fields` attribute from the `ModelMetaclass`.
@@ -321,18 +360,58 @@ class HierarchyMixin(ScopedStorageMixin):
         # A cache of the parent block, retrieved from .parent
         self._parent_block = None
         self._parent_block_id = None
+        self._child_cache = {}
+
+        for_parent = kwargs.pop('for_parent', None)
+
+        if for_parent is not None:
+            self._parent_block = for_parent
+            self._parent_block_id = for_parent.scope_ids.usage_id
 
         super(HierarchyMixin, self).__init__(**kwargs)
 
     def get_parent(self):
         """Return the parent block of this block, or None if there isn't one."""
-        if self._parent_block_id != self.parent:
+        if not self.has_cached_parent:
             if self.parent is not None:
                 self._parent_block = self.runtime.get_block(self.parent)
             else:
                 self._parent_block = None
             self._parent_block_id = self.parent
         return self._parent_block
+
+    @property
+    def has_cached_parent(self):
+        """Return whether this block has a cached parent block."""
+        return self.parent is not None and self._parent_block_id == self.parent
+
+    def get_child(self, usage_id):
+        """Return the child identified by ``usage_id``."""
+        if usage_id in self._child_cache:
+            return self._child_cache[usage_id]
+
+        child_block = self.runtime.get_block(usage_id, for_parent=self)
+        self._child_cache[usage_id] = child_block
+        return child_block
+
+    def get_children(self, usage_id_filter=None):
+        """
+        Return instantiated XBlocks for each of this blocks ``children``.
+        """
+        if not self.has_children:
+            return []
+
+        return [
+            self.get_child(usage_id)
+            for usage_id in self.children
+            if usage_id_filter is None or usage_id_filter(usage_id)
+        ]
+
+    def clear_child_cache(self):
+        """
+        Reset the cache of children stored on this XBlock.
+        """
+        self._child_cache.clear()
 
 
 class XmlSerializationMixin(ScopedStorageMixin):
@@ -363,6 +442,8 @@ class XmlSerializationMixin(ScopedStorageMixin):
         # The base implementation: child nodes become child blocks.
         # Or fields, if they belong to the right namespace.
         for child in node:
+            if child.tag is etree.Comment:
+                continue
             qname = etree.QName(child)
             tag = qname.localname
             namespace = qname.namespace
@@ -399,7 +480,7 @@ class XmlSerializationMixin(ScopedStorageMixin):
         for field_name, field in self.fields.iteritems():
             if field_name in ('children', 'parent', 'content'):
                 continue
-            if field.is_set_on(self):
+            if field.is_set_on(self) or field.force_export:
                 self._add_field(node, field_name, field)
 
         # Add children for each of our children.
@@ -440,10 +521,78 @@ class XmlSerializationMixin(ScopedStorageMixin):
         Depending on settings, it either stores the value of field
         as an xml attribute or creates a separate child node.
         """
+        value = field.to_string(field.read_from(self))
+
+        if value is None:
+            value = ""
+
         if field.xml_node:
             tag = etree.QName(XML_NAMESPACES["option"], field_name)
             elem = node.makeelement(tag)
-            elem.text = field.to_string(field.read_from(self))
+            elem.text = value
             node.insert(0, elem)
         else:
-            node.set(field_name, unicode(field.read_from(self)))
+            node.set(field_name, value)
+
+
+class IndexInfoMixin(object):
+    """
+    This mixin provides interface for classes that wish to provide index
+    information which might be used within a search index
+    """
+
+    def index_dictionary(self):
+        """
+        return key/value fields to feed an index within in a Python dict object
+        values may be numeric / string or dict
+        default implementation is an empty dict
+        """
+        return {}
+
+
+class ViewsMixin(object):
+    """
+    This mixin provides decorators that can be used on xBlock view methods.
+    """
+    @classmethod
+    def supports(cls, *functionalities):
+        """
+        A view decorator to indicate that an xBlock view has support for the
+        given functionalities.
+
+        Arguments:
+            functionalities: String identifiers for the functionalities of the view.
+                For example: "multi_device".
+        """
+        def _decorator(view):
+            """
+            Internal decorator that updates the given view's list of supported
+            functionalities.
+            """
+            # pylint: disable=protected-access
+            if not hasattr(view, "_supports"):
+                view._supports = set()
+            for functionality in functionalities:
+                view._supports.add(functionality)
+            return view
+        return _decorator
+
+    def has_support(self, view, functionality):
+        """
+        Returns whether the given view has support for the given functionality.
+
+        An XBlock view declares support for a functionality with the
+        @XBlock.supports decorator. The decorator stores information on the view.
+
+        Note: We implement this as an instance method to allow xBlocks to
+        override it, if necessary.
+
+        Arguments:
+            view (object): The view of the xBlock.
+            functionality (string): A functionality of the view.
+                For example: "multi_device".
+
+        Returns:
+            True or False
+        """
+        return hasattr(view, "_supports") and functionality in view._supports  # pylint: disable=protected-access

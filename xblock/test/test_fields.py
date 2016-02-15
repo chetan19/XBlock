@@ -22,10 +22,13 @@ from xblock.core import XBlock, Scope
 from xblock.field_data import DictFieldData
 from xblock.fields import (
     Any, Boolean, Dict, Field, Float,
-    Integer, List, String, DateTime, Reference, ReferenceList, Sentinel
+    Integer, List, Set, String, DateTime, Reference, ReferenceList, Sentinel,
+    UNIQUE_ID
 )
 
-from xblock.test.tools import assert_equals, assert_not_equals, assert_not_in, TestRuntime
+from xblock.test.tools import (
+    assert_equals, assert_not_equals, assert_in, assert_not_in, assert_false, TestRuntime
+)
 from xblock.fields import scope_key, ScopeIds
 
 
@@ -34,9 +37,9 @@ class FieldTest(unittest.TestCase):
 
     FIELD_TO_TEST = Mock()
 
-    def set_and_get_field(self, arg, enforce_type):
+    def get_block(self, enforce_type):
         """
-        Set the field to arg in a Block, get it and return it
+        Create a block with a field 'field_x' that is of type FIELD_TO_TEST.
         """
         class TestBlock(XBlock):
             """
@@ -45,7 +48,13 @@ class FieldTest(unittest.TestCase):
             field_x = self.FIELD_TO_TEST(enforce_type=enforce_type)
 
         runtime = TestRuntime(services={'field-data': DictFieldData({})})
-        block = TestBlock(runtime, scope_ids=Mock(spec=ScopeIds))
+        return TestBlock(runtime, scope_ids=Mock(spec=ScopeIds))
+
+    def set_and_get_field(self, arg, enforce_type):
+        """
+        Set the field to arg in a Block, get it and return the set value.
+        """
+        block = self.get_block(enforce_type)
         block.field_x = arg
         return block.field_x
 
@@ -220,6 +229,7 @@ class StringTest(FieldTest):
         self.assertJSONOrSetTypeError({})
 
 
+@ddt.ddt
 class DateTest(FieldTest):
     """
     Tests of the Date field.
@@ -254,6 +264,26 @@ class DateTest(FieldTest):
             '2014-04-01T02:03:04.000000',
             dt.datetime(2014, 4, 1, 2, 3, 4).replace(tzinfo=pytz.utc)
         )
+
+    @ddt.unpack
+    @ddt.data(
+        (
+            dt.datetime(2014, 4, 1, 2, 3, 4).replace(tzinfo=pytz.utc),
+            dt.datetime(2014, 4, 1, 2, 3, 5)
+        ),
+        (
+            dt.datetime(2014, 4, 1, 2, 3, 4),
+            dt.datetime(2014, 4, 1, 2, 3, 4).replace(tzinfo=pytz.utc),
+        )
+    )
+    def test_naive(self, original, replacement):
+        """
+        Make sure field comparison doesn't crash when comparing naive and non-naive datetimes.
+        """
+        for enforce_type in (False, True):
+            block = self.get_block(enforce_type)
+            block.field_x = original
+            block.field_x = replacement
 
     def test_none(self):
         self.assertJSONOrSetEquals(None, None)
@@ -314,6 +344,33 @@ class ListTest(FieldTest):
         self.assertJSONOrSetTypeError(3.7)
         self.assertJSONOrSetTypeError(True)
         self.assertJSONOrSetTypeError({})
+
+
+class SetTest(FieldTest):
+    """
+    Tests the Set Field.
+    """
+    FIELD_TO_TEST = Set
+
+    def test_json_equals(self):
+        self.assertJSONOrSetEquals(set(), set())
+        self.assertJSONOrSetEquals(set(['foo', 'bar']), set(['foo', 'bar']))
+        self.assertJSONOrSetEquals(set(['bar', 'foo']), set(['foo', 'bar']))
+        self.assertJSONOrSetEquals(set([1, 3.14]), set([1, 3.14]))
+        self.assertJSONOrSetEquals(set([1, 3.14]), set([1, 3.14, 1]))
+
+    def test_hashable_converts(self):
+        self.assertJSONOrSetEquals(set([1, 3.4]), [1, 3.4])
+        self.assertJSONOrSetEquals(set(['a', 'b']), 'ab')
+        self.assertJSONOrSetEquals(set(['k1', 'k2']), {'k1': 1, 'k2': '2'})
+
+    def test_none(self):
+        self.assertJSONOrSetEquals(None, None)
+
+    def test_error(self):
+        self.assertJSONOrSetTypeError(42)
+        self.assertJSONOrSetTypeError(3.7)
+        self.assertJSONOrSetTypeError(True)
 
 
 class ReferenceTest(FieldTest):
@@ -447,6 +504,41 @@ def test_field_display_name():
     assert_equals("Field Known as X", TestBlock.field_x.display_name)
 
 
+def test_unique_id_default():
+    class TestBlock(XBlock):
+        """
+        Block for testing
+        """
+        field_a = String(default=UNIQUE_ID, scope=Scope.settings)
+        field_b = String(default=UNIQUE_ID, scope=Scope.user_state)
+
+    sids = ScopeIds(user_id="bob",
+                    block_type="bobs-type",
+                    def_id="definition-id",
+                    usage_id="usage-id")
+
+    runtime = TestRuntime(services={'field-data': DictFieldData({})})
+    block = TestBlock(runtime, DictFieldData({}), sids)
+    unique_a = block.field_a
+    unique_b = block.field_b
+    # Create another instance of the same block. Unique ID defaults should not change.
+    runtime = TestRuntime(services={'field-data': DictFieldData({})})
+    block = TestBlock(runtime, DictFieldData({}), sids)
+    assert_equals(unique_a, block.field_a)
+    assert_equals(unique_b, block.field_b)
+    # Change the user id. Unique ID default should change for field_b with
+    # user_state scope, but not for field_a with scope=settings.
+    runtime = TestRuntime(services={'field-data': DictFieldData({})})
+    block = TestBlock(runtime, DictFieldData({}), sids._replace(user_id='alice'))
+    assert_equals(unique_a, block.field_a)
+    assert_not_equals(unique_b, block.field_b)
+    # Change the usage id. Unique ID default for both fields should change.
+    runtime = TestRuntime(services={'field-data': DictFieldData({})})
+    block = TestBlock(runtime, DictFieldData({}), sids._replace(usage_id='usage-2'))
+    assert_not_equals(unique_a, block.field_a)
+    assert_not_equals(unique_b, block.field_b)
+
+
 def test_values():
     # static return value
     field_values = ['foo', 'bar']
@@ -474,6 +566,23 @@ def test_values_dict():
     # Test that the format expected for integers is allowed
     test_field = Integer(values={"min": 1, "max": 100})
     assert_equals({"min": 1, "max": 100}, test_field.values)
+
+
+def test_set_incomparable_fields():
+    # if we can't compare a field's value to the value it's going to be reset to
+    # (i.e. timezone aware and unaware datetimes), just reset the value.
+
+    class FieldTester(XBlock):
+        """Test block for this test."""
+        incomparable = Field(scope=Scope.settings)
+
+    not_timezone_aware = dt.datetime(2015, 1, 1)
+    timezone_aware = dt.datetime(2015, 1, 1, tzinfo=pytz.UTC)
+    runtime = TestRuntime(services={'field-data': DictFieldData({})})
+    field_tester = FieldTester(runtime, scope_ids=Mock(spec=ScopeIds))
+    field_tester.incomparable = not_timezone_aware
+    field_tester.incomparable = timezone_aware
+    assert_equals(field_tester.incomparable, timezone_aware)
 
 
 def test_twofaced_field_access():
@@ -508,6 +617,39 @@ def test_twofaced_field_access():
     assert_not_in('how_many', field_tester._get_fields_to_save())   # pylint: disable=W0212
 
 
+def test_setting_the_same_value_marks_field_as_dirty():
+    """
+    Check that setting field to the same value marks mutable fields as dirty.
+    However, since the value hasn't changed, these fields won't be saved.
+    """
+    class FieldTester(XBlock):
+        """Test block for set - get test."""
+        non_mutable = String(scope=Scope.settings)
+        list_field = List(scope=Scope.settings)
+        dict_field = Dict(scope=Scope.settings)
+
+    runtime = TestRuntime(services={'field-data': DictFieldData({})})
+    field_tester = FieldTester(runtime, scope_ids=Mock(spec=ScopeIds))
+
+    # precondition checks
+    assert_equals(len(field_tester._dirty_fields), 0)
+    assert_false(field_tester.fields['list_field'].is_set_on(field_tester))
+    assert_false(field_tester.fields['dict_field'].is_set_on(field_tester))
+    assert_false(field_tester.fields['non_mutable'].is_set_on(field_tester))
+
+    field_tester.non_mutable = field_tester.non_mutable
+    field_tester.list_field = field_tester.list_field
+    field_tester.dict_field = field_tester.dict_field
+
+    assert_not_in(field_tester.fields['non_mutable'], field_tester._dirty_fields)
+    assert_in(field_tester.fields['list_field'], field_tester._dirty_fields)
+    assert_in(field_tester.fields['dict_field'], field_tester._dirty_fields)
+
+    assert_false(field_tester.fields['non_mutable'].is_set_on(field_tester))
+    assert_false(field_tester.fields['list_field'].is_set_on(field_tester))
+    assert_false(field_tester.fields['dict_field'].is_set_on(field_tester))
+
+
 class SentinelTest(unittest.TestCase):
     """
     Tests of :ref:`xblock.fields.Sentinel`.
@@ -537,15 +679,24 @@ class FieldSerializationTest(unittest.TestCase):
         """
         Helper method: checks if _type's to_string given instance of _type returns expected string
         """
-        result = _type(enforce_type=True).to_string(value)
+        result = _type().to_string(value)
         self.assertEquals(result, string)
 
     def assert_from_string(self, _type, string, value):
         """
         Helper method: checks if _type's from_string given string representation of type returns expected value
         """
-        result = _type(enforce_type=True).from_string(string)
+        result = _type().from_string(string)
         self.assertEquals(result, value)
+
+    # Serialisation test data that is tested both ways, i.e. whether serialisation of the value
+    # yields the string and deserialisation of the string yields the value.
+    @ddt.unpack
+    @ddt.data(
+        (DateTime, None, None)
+    )
+    def test_to_string(self, _type, value, string):
+        self.assert_to_string(_type, value, string)
 
     @ddt.unpack
     @ddt.data(
@@ -585,7 +736,10 @@ class FieldSerializationTest(unittest.TestCase):
                 2,
                 3
               ]
-            }""")))
+            }""")),
+        (DateTime, dt.datetime(2014, 4, 1, 2, 3, 4, 567890).replace(tzinfo=pytz.utc), '2014-04-01T02:03:04.567890'),
+        (DateTime, dt.datetime(2014, 4, 1, 2, 3, 4).replace(tzinfo=pytz.utc), '2014-04-01T02:03:04.000000'),
+    )
     def test_both_directions(self, _type, value, string):
         """Easy cases that work in both directions."""
         self.assert_to_string(_type, value, string)
@@ -597,9 +751,13 @@ class FieldSerializationTest(unittest.TestCase):
         (Float, 1.0, r"1|1\.0*"),
         (Float, -10.0, r"-10|-10\.0*"))
     def test_to_string_regexp_matches(self, _type, value, regexp):
-        result = _type(enforce_type=True).to_string(value)
+        result = _type().to_string(value)
         self.assertRegexpMatches(result, regexp)
 
+    # Test data for non-canonical serialisations of values that we should be able to correctly
+    # deserialise.  These values are not serialised to the representation given here for various
+    # reasons; some of them are non-standard number representations, others are YAML data that
+    # isn't valid JSON, yet others use non-standard capitalisation.
     @ddt.unpack
     @ddt.data(
         (Integer, "0xff", 0xff),
@@ -665,7 +823,12 @@ class FieldSerializationTest(unittest.TestCase):
                   kaw: null
             """),
             [1, 2.345, {"foo": True, "bar": [1, 2, 3]}, {"meow": False, "woof": True, "kaw": None}]
-        )
+        ),
+        # Test that legacy DateTime format including double quotes can still be imported for compatibility with
+        # old data export tar balls.
+        (DateTime, '"2014-04-01T02:03:04.567890"', dt.datetime(2014, 4, 1, 2, 3, 4, 567890).replace(tzinfo=pytz.utc)),
+        (DateTime, '"2014-04-01T02:03:04.000000"', dt.datetime(2014, 4, 1, 2, 3, 4).replace(tzinfo=pytz.utc)),
+        (DateTime, '', None),
     )
     def test_from_string(self, _type, string, value):
         self.assert_from_string(_type, string, value)
@@ -676,7 +839,7 @@ class FieldSerializationTest(unittest.TestCase):
         This special test case is necessary since
         float('nan') compares inequal to everything.
         """
-        result = Float(enforce_type=True).from_string('NaN')
+        result = Float().from_string('NaN')
         self.assertTrue(math.isnan(result))
 
     @ddt.unpack
@@ -686,4 +849,4 @@ class FieldSerializationTest(unittest.TestCase):
     def test_from_string_errors(self, _type, string):
         """ Cases that raises various exceptions."""
         with self.assertRaises(StandardError):
-            _type(enforce_type=True).from_string(string)
+            _type().from_string(string)

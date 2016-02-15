@@ -1,4 +1,5 @@
 # 3rd-party needs
+pyyaml
 lxml
 requests
 webob
@@ -27,3 +28,6 @@ cookiecutter
 
 # Our own XBlocks
 -e .
+
+# pyfilesystem
+fs

@@ -1,11 +1,18 @@
 """
 Tests of the XBlock-family functionality mixins
 """
-
+import ddt as ddt
+from datetime import datetime
+import pytz
+from lxml import etree
+import mock
 from unittest import TestCase
 
-from xblock.fields import List, Scope, Integer
-from xblock.mixins import ScopedStorageMixin, HierarchyMixin
+from xblock.core import XBlock
+from xblock.fields import List, Scope, Integer, String, ScopeIds, UNIQUE_ID, DateTime
+from xblock.field_data import DictFieldData
+from xblock.mixins import ScopedStorageMixin, HierarchyMixin, IndexInfoMixin, ViewsMixin
+from xblock.runtime import Runtime
 
 
 class AttrAssertionMixin(TestCase):
@@ -118,3 +125,191 @@ class TestHierarchyMixin(AttrAssertionMixin, TestCase):
         self.assertEqual(Scope.children, self.HasChildren.children.scope)
         self.assertIsInstance(self.InheritedChildren.children, List)
         self.assertEqual(Scope.children, self.InheritedChildren.children.scope)
+
+
+class TestIndexInfoMixin(AttrAssertionMixin):
+    """
+    Tests for Index
+    """
+    class IndexInfoMixinTester(IndexInfoMixin):
+        """Test class for index mixin"""
+        pass
+
+    def test_index_info(self):
+        self.assertHasAttr(self.IndexInfoMixinTester, 'index_dictionary')
+        with_index_info = self.IndexInfoMixinTester().index_dictionary()
+        self.assertFalse(with_index_info)
+        self.assertTrue(isinstance(with_index_info, dict))
+
+
+class TestViewsMixin(TestCase):
+    """
+    Tests for ViewsMixin
+    """
+    def test_supports_view_decorator(self):
+        """
+        Tests the @supports decorator for xBlock view methods
+        """
+        class SupportsDecoratorTester(ViewsMixin):
+            """
+            Test class for @supports decorator
+            """
+            @ViewsMixin.supports("a_functionality")
+            def functionality_supported_view(self):
+                """
+                A view that supports a functionality
+                """
+                pass  # pragma: no cover
+
+            @ViewsMixin.supports("functionality1", "functionality2")
+            def multi_featured_view(self):
+                """
+                A view that supports multiple functionalities
+                """
+                pass  # pragma: no cover
+
+            def an_unsupported_view(self):
+                """
+                A view that does not support any functionality
+                """
+                pass  # pragma: no cover
+
+        test_xblock = SupportsDecoratorTester()
+
+        for view_name, functionality, expected_result in (
+                ("functionality_supported_view", "a_functionality", True),
+                ("functionality_supported_view", "bogus_functionality", False),
+                ("functionality_supported_view", None, False),
+
+                ("an_unsupported_view", "a_functionality", False),
+
+                ("multi_featured_view", "functionality1", True),
+                ("multi_featured_view", "functionality2", True),
+                ("multi_featured_view", "bogus_functionality", False),
+        ):
+            self.assertEquals(
+                test_xblock.has_support(getattr(test_xblock, view_name), functionality),
+                expected_result
+            )
+
+    def test_has_support_override(self):
+        """
+        Tests overriding has_support
+        """
+        class HasSupportOverrideTester(ViewsMixin):
+            """
+            Test class for overriding has_support
+            """
+            def has_support(self, view, functionality):
+                """
+                Overrides implementation of has_support
+                """
+                return functionality == "a_functionality"
+
+        test_xblock = HasSupportOverrideTester()
+
+        for view_name, functionality, expected_result in (
+                ("functionality_supported_view", "a_functionality", True),
+                ("functionality_supported_view", "bogus_functionality", False),
+        ):
+            self.assertEquals(
+                test_xblock.has_support(getattr(test_xblock, view_name, None), functionality),
+                expected_result
+            )
+
+
+@ddt.ddt
+class TestXmlSerializationMixin(TestCase):
+    """ Tests for XmlSerialization Mixin """
+
+    # pylint:disable=invalid-name
+    class TestXBlock(XBlock):
+        """ XBlock for XML export test """
+        etree_node_tag = 'test_xblock'
+
+        field = String()
+        simple = String(default="default")
+        simple_force_export = String(default="default", force_export=True)
+        unique_id = String(default=UNIQUE_ID)
+        unique_id_force_export = String(default=UNIQUE_ID, force_export=True)
+
+    class TestXBlockWithDateTime(XBlock):
+        """ XBlock for DateTime fields export """
+        etree_node_tag = 'test_xblock_with_datetime'
+
+        datetime = DateTime(default=None)
+
+    def _make_block(self, block_type=None):
+        """ Creates a test block """
+        block_type = block_type if block_type else self.TestXBlock
+        runtime_mock = mock.Mock(spec=Runtime)
+        scope_ids = ScopeIds("user_id", block_type.etree_node_tag, "def_id", "usage_id")
+        return block_type(runtime_mock, field_data=DictFieldData({}), scope_ids=scope_ids)
+
+    def _assert_node_attributes(self, node, expected_attributes):
+        """ Checks XML node attributes to match expected_attributes"""
+        node_attributes = node.keys()
+        node_attributes.remove('xblock-family')
+
+        self.assertEqual(node.get('xblock-family'), self.TestXBlock.entry_point)
+        self.assertEqual(set(node_attributes), set(expected_attributes.keys()))
+
+        for key, value in expected_attributes.iteritems():
+            if value != UNIQUE_ID:
+                self.assertEqual(node.get(key), value)
+            else:
+                self.assertIsNotNone(node.get(key))
+
+    def test_add_xml_to_node(self):
+        """ Tests add_xml_to_node with various field defaults and runtime parameters """
+        block_type = self.TestXBlock
+        block = self._make_block(block_type)
+        node = etree.Element(block_type.etree_node_tag)
+
+        # precondition check
+        for field_name in block.fields.keys():
+            self.assertFalse(block.fields[field_name].is_set_on(block))
+
+        block.add_xml_to_node(node)
+
+        self._assert_node_attributes(
+            node, {'simple_force_export': 'default', 'unique_id_force_export': UNIQUE_ID}
+        )
+
+        block.field = 'Value1'
+        block.simple = 'Value2'
+        block.simple_force_export = 'Value3'
+        block.unique_id = 'Value4'
+        block.unique_id_force_export = 'Value5'
+
+        block.add_xml_to_node(node)
+
+        self._assert_node_attributes(
+            node,
+            {
+                'field': 'Value1',
+                'simple': 'Value2',
+                'simple_force_export': 'Value3',
+                'unique_id': 'Value4',
+                'unique_id_force_export': 'Value5',
+            }
+        )
+
+    @ddt.data(
+        (None, {'datetime': ''}),
+        (datetime(2014, 4, 1, 2, 3, 4, 567890).replace(tzinfo=pytz.utc), {'datetime': '2014-04-01T02:03:04.567890'})
+    )
+    @ddt.unpack
+    def test_datetime_serialization(self, value, expected_attributes):
+        """
+        Tests exporting DateTime fields to XML
+        """
+        block_type = self.TestXBlockWithDateTime
+        block = self._make_block(block_type)
+        node = etree.Element(block_type.etree_node_tag)
+
+        block.datetime = value
+
+        block.add_xml_to_node(node)
+
+        self._assert_node_attributes(node, expected_attributes)
